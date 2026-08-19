@@ -1,0 +1,16 @@
+version: "3.8"
+
+services:
+  frenzy-store:
+    build: .
+    container_name: frenzy-store
+    ports:
+      - "8080:80"
+    volumes:
+      # Keeps frenzy_store.sqlite safe even if the container is
+      # rebuilt or restarted — persists on your host machine.
+      - frenzy-db:/var/www/html
+    restart: unless-stopped
+
+volumes:
+  frenzy-db:
