@@ -36,7 +36,7 @@ const WEBHOOK_SECRET = '';
 
 // Payment configuration — edit these for your own store.
 $upiId        = 'sahid.frenzy@fam';
-$paymentName  = Frenzy Store;
+$paymentName = "Frenzy Store";
 $qrImageUrl   = ''; // optional: a hosted image URL of your UPI QR code
 
 // Product catalog. Keyed by price so callback data like "buy_99" can
