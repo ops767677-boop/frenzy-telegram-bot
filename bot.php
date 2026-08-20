@@ -1,34 +1,55 @@
 <?php
 /**
  * =====================================================================
- * ⚡ FRENZY STORE - Telegram Bot Backend (Fixed & Fully Updated)
+ * FRENZY STORE - Telegram Bot Backend
+ * =====================================================================
+ * Handles: /start, browsing products, wallet balance + fund top-ups,
+ * order creation & delivery, manual UPI/UTR payment verification,
+ * admin dashboard (/admin), order history, profile, and support.
+ *
+ * SECURITY NOTES
+ * - This file must NEVER be included from index.php or exposed to the
+ *   browser. It should only be reachable as your Telegram webhook URL.
+ * - The bot token lives ONLY here.
+ * - All SQL uses PDO prepared statements.
+ * - Every admin-only action re-checks the sender's Telegram ID — that
+ *   ID *is* the login, there is no separate password to manage or leak.
+ * - Payments are NEVER auto-approved. A human admin must approve.
  * =====================================================================
  */
 
 declare(strict_types=1);
 error_reporting(E_ALL);
-ini_set('display_errors', '0'); // Never leak raw errors
+ini_set('display_errors', '0'); // never show raw PHP errors to anyone
 
 // ---------------------------------------------------------------------
 // 1. CONFIGURATION
 // ---------------------------------------------------------------------
 const BOT_TOKEN  = '8965830768:AAFVs8RxGGwnLwIW8n1msmD0NUQqwzUIRpA';
 const ADMIN_ID   = '8047005584';
-const STORE_NAME = '⚡ FRENZY STORE ⚡';
+const STORE_NAME = 'Frenzy Store';
 const DB_FILE    = __DIR__ . '/frenzy_store.sqlite';
 
-const WEBHOOK_SECRET = ''; // Optional webhook secret token
+// Optional webhook secret token (set the same value when you call
+// setWebhook with &secret_token=... — see README.txt). Leave blank to
+// disable this extra check.
+const WEBHOOK_SECRET = '';
 
-// Payment configuration
-$upiId        = 'sahid.frenzy@fam';
-$paymentName  = 'Frenzy Store'; // Fixed string quotes
-$qrImageUrl   = ''; 
+// Minimum / maximum wallet top-up amount (in ₹).
+const MIN_TOPUP = 10;
+const MAX_TOPUP = 100000;
 
-// Product catalog
+// Payment configuration — edit these for your own store.
+$upiId       = 'YOUR_UPI_ID';
+$paymentName = STORE_NAME;
+$qrImageUrl  = ''; // optional: a hosted image URL of your UPI QR code
+
+// Product catalog. Keyed by price so callback data like "buy_99" can
+// look a product up directly. Keep prices unique.
 $PRODUCTS = [
-    99  => ['name' => 'Premium Digital Product', 'emoji' => '👑', 'tag' => '🔥 POPULAR'],
-    199 => ['name' => 'VIP Digital Product',      'emoji' => '💎', 'tag' => '✨ VIP'],
-    499 => ['name' => 'Ultimate Package',         'emoji' => '⚡', 'tag' => '🚀 BEST VALUE'],
+    99  => ['name' => 'Premium Digital Product', 'emoji' => '👑', 'tag' => 'POPULAR'],
+    199 => ['name' => 'VIP Digital Product',      'emoji' => '💎', 'tag' => 'VIP'],
+    499 => ['name' => 'Ultimate Package',         'emoji' => '⚡', 'tag' => 'BEST VALUE'],
 ];
 
 // ---------------------------------------------------------------------
@@ -54,6 +75,7 @@ function initSchema(PDO $pdo): void
         username    TEXT,
         first_name  TEXT,
         state       TEXT DEFAULT 'idle',
+        balance     REAL DEFAULT 0,
         created_at  TEXT DEFAULT CURRENT_TIMESTAMP
     )");
 
@@ -64,8 +86,19 @@ function initSchema(PDO $pdo): void
         product     TEXT NOT NULL,
         amount      TEXT NOT NULL,
         status      TEXT NOT NULL DEFAULT 'created',
-        utr         TEXT,
         delivery    TEXT,
+        created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at  TEXT DEFAULT CURRENT_TIMESTAMP
+    )");
+
+    // Wallet top-up requests (adding funds via UPI + UTR, admin-verified).
+    $pdo->exec("CREATE TABLE IF NOT EXISTS wallet_topups (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        topup_id    TEXT UNIQUE NOT NULL,
+        telegram_id TEXT NOT NULL,
+        amount      REAL NOT NULL,
+        status      TEXT NOT NULL DEFAULT 'pending_payment',
+        utr         TEXT,
         created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
         updated_at  TEXT DEFAULT CURRENT_TIMESTAMP
     )");
@@ -78,7 +111,21 @@ function initSchema(PDO $pdo): void
     )");
 
     $pdo->exec("CREATE INDEX IF NOT EXISTS idx_orders_telegram_id ON orders(telegram_id)");
+    $pdo->exec("CREATE INDEX IF NOT EXISTS idx_topups_telegram_id ON wallet_topups(telegram_id)");
 }
+
+/*
+ * Order status lifecycle:
+ *   paid       -> wallet had enough balance, deducted instantly, awaiting delivery
+ *   completed  -> admin has sent the digital delivery
+ *   cancelled  -> customer cancelled before confirming
+ *
+ * Wallet top-up status lifecycle (kept explicit, never auto-approved):
+ *   pending_payment       -> top-up request created, waiting for customer to pay
+ *   pending_verification  -> UTR submitted, waiting for admin
+ *   completed              -> admin approved, wallet credited
+ *   rejected                -> admin rejected
+ */
 
 // ---------------------------------------------------------------------
 // 3. TELEGRAM API HELPER
@@ -136,7 +183,7 @@ function answerCallback(string $callbackId, string $text = '', bool $alert = fal
 }
 
 // ---------------------------------------------------------------------
-// 4. UTILITIES
+// 4. SMALL UTILITIES
 // ---------------------------------------------------------------------
 function h(string $s): string
 {
@@ -153,13 +200,23 @@ function generateOrderId(): string
     return 'FRENZY-' . strtoupper(bin2hex(random_bytes(3)));
 }
 
+function generateTopupId(): string
+{
+    return 'WALLET-' . strtoupper(bin2hex(random_bytes(3)));
+}
+
+function money(float $amount): string
+{
+    return '₹' . number_format($amount, 2);
+}
+
 function friendlyError(string $chatId): void
 {
-    sendMessage($chatId, "⚠️ <b>Oops! Something went wrong.</b> 🤖💥\n\nPlease try again or reach out to support.");
+    sendMessage($chatId, "⚠️ Something went wrong.\n\nPlease try again or contact support.");
 }
 
 // ---------------------------------------------------------------------
-// 5. USER & ORDER HELPERS
+// 5. USER / WALLET HELPERS
 // ---------------------------------------------------------------------
 function upsertUser(string $telegramId, ?string $username, ?string $firstName): void
 {
@@ -190,13 +247,48 @@ function setUserState(string $telegramId, string $state): void
     $stmt->execute([$state, $telegramId]);
 }
 
-function createOrder(string $telegramId, string $productName, string $amount): array
+function getBalance(string $telegramId): float
+{
+    $stmt = db()->prepare('SELECT balance FROM users WHERE telegram_id = ?');
+    $stmt->execute([$telegramId]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    return $row ? (float)$row['balance'] : 0.0;
+}
+
+function adjustBalance(string $telegramId, float $delta): float
+{
+    $pdo = $pdo ?? db();
+    $pdo = db();
+    $pdo->beginTransaction();
+    try {
+        $stmt = $pdo->prepare('SELECT balance FROM users WHERE telegram_id = ? FOR UPDATE');
+        // SQLite has no FOR UPDATE, but the transaction still serializes writes.
+        $stmt = $pdo->prepare('SELECT balance FROM users WHERE telegram_id = ?');
+        $stmt->execute([$telegramId]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        $current = $row ? (float)$row['balance'] : 0.0;
+        $new = $current + $delta;
+
+        $upd = $pdo->prepare('UPDATE users SET balance = ? WHERE telegram_id = ?');
+        $upd->execute([$new, $telegramId]);
+        $pdo->commit();
+        return $new;
+    } catch (Throwable $e) {
+        $pdo->rollBack();
+        throw $e;
+    }
+}
+
+// ---------------------------------------------------------------------
+// 6. ORDER / TOPUP HELPERS
+// ---------------------------------------------------------------------
+function createOrder(string $telegramId, string $productName, string $amount, string $status): array
 {
     $orderId = generateOrderId();
     $stmt = db()->prepare(
         'INSERT INTO orders (order_id, telegram_id, product, amount, status) VALUES (?, ?, ?, ?, ?)'
     );
-    $stmt->execute([$orderId, $telegramId, $productName, $amount, 'pending_payment']);
+    $stmt->execute([$orderId, $telegramId, $productName, $amount, $status]);
     return getOrder($orderId);
 }
 
@@ -208,66 +300,104 @@ function getOrder(string $orderId): ?array
     return $row ?: null;
 }
 
-function updateOrderStatus(string $orderId, string $status, ?string $extraCol = null, ?string $extraVal = null): void
+function updateOrderStatus(string $orderId, string $status, ?string $delivery = null): void
 {
-    if ($extraCol !== null && in_array($extraCol, ['utr', 'delivery'], true)) {
-        $stmt = db()->prepare("UPDATE orders SET status = ?, {$extraCol} = ?, updated_at = CURRENT_TIMESTAMP WHERE order_id = ?");
-        $stmt->execute([$status, $extraVal, $orderId]);
+    if ($delivery !== null) {
+        $stmt = db()->prepare("UPDATE orders SET status = ?, delivery = ?, updated_at = CURRENT_TIMESTAMP WHERE order_id = ?");
+        $stmt->execute([$status, $delivery, $orderId]);
     } else {
         $stmt = db()->prepare('UPDATE orders SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE order_id = ?');
         $stmt->execute([$status, $orderId]);
     }
 }
 
+function createTopup(string $telegramId, float $amount): array
+{
+    $topupId = generateTopupId();
+    $stmt = db()->prepare(
+        'INSERT INTO wallet_topups (topup_id, telegram_id, amount, status) VALUES (?, ?, ?, ?)'
+    );
+    $stmt->execute([$topupId, $telegramId, $amount, 'pending_payment']);
+    return getTopup($topupId);
+}
+
+function getTopup(string $topupId): ?array
+{
+    $stmt = db()->prepare('SELECT * FROM wallet_topups WHERE topup_id = ?');
+    $stmt->execute([$topupId]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    return $row ?: null;
+}
+
+function updateTopupStatus(string $topupId, string $status, ?string $utr = null): void
+{
+    if ($utr !== null) {
+        $stmt = db()->prepare("UPDATE wallet_topups SET status = ?, utr = ?, updated_at = CURRENT_TIMESTAMP WHERE topup_id = ?");
+        $stmt->execute([$status, $utr, $topupId]);
+    } else {
+        $stmt = db()->prepare('UPDATE wallet_topups SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE topup_id = ?');
+        $stmt->execute([$status, $topupId]);
+    }
+}
+
 function statusLabel(string $status): string
 {
     return match ($status) {
-        'created'               => '✨ Created',
+        'created'               => '🆕 Created',
         'pending_payment'       => '⏳ Payment Pending',
-        'pending_verification'  => '🔎 Waiting Admin Verification',
-        'paid'                  => '✅ Payment Verified',
-        'rejected'              => '❌ Payment Rejected',
-        'completed'             => '🎉 Order Delivered',
-        'cancelled'             => '🚫 Cancelled',
-        default                 => ucfirst($status),
+        'pending_verification'  => '⏳ Waiting for Admin Verification',
+        'paid'                  => '✅ Paid — Preparing Delivery',
+        'rejected'              => '❌ Rejected',
+        'completed'             => '🎉 Delivered',
+        'cancelled'              => '🚫 Cancelled',
+        default                  => ucfirst($status),
     };
 }
 
 // ---------------------------------------------------------------------
-// 6. KEYBOARDS & SCREENS (Animated Emojis UI)
+// 7. KEYBOARDS
 // ---------------------------------------------------------------------
 function mainMenuKeyboard(): array
 {
     return [
-        [['text' => '🛍️ Browse Store 🔥', 'callback_data' => 'store'], ['text' => '📦 My Orders 🚚', 'callback_data' => 'orders']],
-        [['text' => '💳 Payment Info 💸', 'callback_data' => 'payment_help'], ['text' => '🎟️ Support 🎧', 'callback_data' => 'support']],
-        [['text' => '👤 Profile 🌟', 'callback_data' => 'profile']],
+        [['text' => '🛍️ Browse Store', 'callback_data' => 'store'], ['text' => '💰 Wallet', 'callback_data' => 'wallet']],
+        [['text' => '📦 My Orders', 'callback_data' => 'orders'], ['text' => '🎟️ Support', 'callback_data' => 'support']],
+        [['text' => '👤 Profile', 'callback_data' => 'profile']],
     ];
 }
 
 function backKeyboard(string $target = 'home'): array
 {
-    return [[['text' => '🔙 Back to Home', 'callback_data' => $target]]];
+    return [[['text' => '⬅️ Back', 'callback_data' => $target]]];
 }
 
-function showHome(string $chatId, string $firstName): void
+// ---------------------------------------------------------------------
+// 8. CUSTOMER SCREENS
+// ---------------------------------------------------------------------
+function brandHeader(): string
 {
-    $text = "👋 <b>Hey, " . h($firstName) . "! Welcome aboard!</b> ✨\n\n"
-          . "🚀 Welcome to <b>" . h(STORE_NAME) . "</b>\n"
-          . "──────────────────────────────\n"
-          . "💎 <b>Premium Digital Products</b>\n"
-          . "⚡ <b>Instant & Superfast Delivery</b>\n"
-          . "🔒 <b>100% Safe & Secure Checkout</b>\n"
-          . "🎧 <b>24/7 Dedicated Support</b>\n"
-          . "──────────────────────────────\n"
-          . "👇 <i>Select an option below to start exploring!</i>";
+    return '✨ <b>' . h(STORE_NAME) . '</b> ✨';
+}
+
+function showHome(string $chatId, string $telegramId, string $firstName): void
+{
+    $balance = getBalance($telegramId);
+    $text = "👋 Welcome, " . h($firstName) . "!\n\n"
+          . brandHeader() . "\n"
+          . "━━━━━━━━━━━━━━━\n"
+          . "🛍️ Premium digital products\n"
+          . "⚡ Instant wallet checkout\n"
+          . "🔐 Secure, admin-verified payments\n"
+          . "🎟️ Real Telegram support\n"
+          . "━━━━━━━━━━━━━━━\n\n"
+          . "💰 Wallet Balance: <b>" . money($balance) . "</b>";
     sendMessage($chatId, $text, mainMenuKeyboard());
 }
 
 function showStore(string $chatId): void
 {
     global $PRODUCTS;
-    $text = "🛒 <b>" . h(STORE_NAME) . " — Catalog</b> ✨\n\nChoose your desired product below:";
+    $text = brandHeader() . "\n<b>Available Products</b>\n━━━━━━━━━━━━━━━\nSelect a product to view details:";
     $rows = [];
     foreach ($PRODUCTS as $price => $p) {
         $rows[] = [[
@@ -275,7 +405,7 @@ function showStore(string $chatId): void
             'callback_data' => 'buy_' . $price,
         ]];
     }
-    $rows[] = [['text' => '🔙 Back to Menu', 'callback_data' => 'home']];
+    $rows[] = [['text' => '⬅️ Back', 'callback_data' => 'home']];
     sendMessage($chatId, $text, $rows);
 }
 
@@ -283,89 +413,88 @@ function showProductConfirm(string $chatId, int $price): void
 {
     global $PRODUCTS;
     if (!isset($PRODUCTS[$price])) {
-        sendMessage($chatId, '⚠️ Product not available.', backKeyboard('store'));
+        sendMessage($chatId, '⚠️ That product is no longer available.', backKeyboard('store'));
         return;
     }
     $p = $PRODUCTS[$price];
-    $text = "🎯 <b>Order Confirmation</b> 🛒\n\n"
-          . "📦 <b>Product:</b> " . $p['emoji'] . " " . h($p['name']) . "\n"
-          . "💰 <b>Price:</b> ₹" . $price . "\n"
-          . "⚡ <b>Delivery:</b> Instant after payment check\n\n"
-          . "Are you sure you want to proceed?";
+    $text = "🛒 <b>Order Confirmation</b>\n━━━━━━━━━━━━━━━\n"
+          . "Product:\n" . $p['emoji'] . ' ' . h($p['name']) . "\n\n"
+          . "Price:\n₹" . $price;
     $kb = [
-        [['text' => '✅ Confirm & Proceed', 'callback_data' => 'confirm_buy_' . $price]],
+        [['text' => '✅ Confirm Order', 'callback_data' => 'confirm_buy_' . $price]],
         [['text' => '❌ Cancel', 'callback_data' => 'cancel_order']],
     ];
     sendMessage($chatId, $text, $kb);
 }
 
-function showPaymentScreen(string $chatId, array $order): void
+// Called after "Confirm Order" — checks wallet balance and either
+// completes the purchase instantly or shows an insufficient-balance
+// prompt, mirroring a standard wallet-based storefront.
+function processPurchase(string $chatId, string $telegramId, int $price, string $productName): void
 {
-    $text = "💳 <b>Checkout & Payment</b> 💸\n\n"
-          . "🆔 <b>Order ID:</b> <code>" . h($order['order_id']) . "</code>\n"
-          . "💵 <b>Amount Due:</b> ₹" . h($order['amount']) . "\n"
-          . "📌 <b>Status:</b> " . statusLabel($order['status']) . "\n\n"
-          . "👇 <i>Click instructions below to make payment!</i>";
-    $kb = [
-        [['text' => '📖 How to Pay (UPI/QR)', 'callback_data' => 'payinfo_' . $order['order_id']]],
-        [['text' => '📤 Submit UTR / Ref No.', 'callback_data' => 'subutr_' . $order['order_id']]],
-        [['text' => '❌ Cancel Order', 'callback_data' => 'cancel_order']],
-    ];
-    sendMessage($chatId, $text, $kb);
-}
+    $balance = getBalance($telegramId);
 
-function showPaymentInstructions(string $chatId, array $order): void
-{
-    global $upiId, $paymentName, $qrImageUrl;
-
-    $text = "📲 <b>UPI Payment Instructions</b> 💸\n\n"
-          . "🆔 <b>Order:</b> <code>" . h($order['order_id']) . "</code>\n"
-          . "💰 <b>Amount:</b> <b>₹" . h($order['amount']) . "</b>\n\n"
-          . "👇 <b>Pay using UPI ID:</b>\n"
-          . "<code>" . h($upiId) . "</code>\n"
-          . "👤 <b>Name:</b> " . h($paymentName) . "\n\n"
-          . "⚡ <b>Steps:</b>\n"
-          . "1️⃣ Open Google Pay / PhonePe / Paytm\n"
-          . "2️⃣ Pay exact amount ₹" . h($order['amount']) . "\n"
-          . "3️⃣ Copy the 12-digit <b>UTR / Transaction ID</b>\n"
-          . "4️⃣ Click <b>'Submit UTR'</b> button below and paste it!";
-
-    if ($qrImageUrl !== '') {
-        tg('sendPhoto', [
-            'chat_id' => $chatId,
-            'photo'   => $qrImageUrl,
-            'caption' => "📸 Scan QR to pay ₹" . h($order['amount']),
-        ]);
+    if ($balance < $price) {
+        $need = $price - $balance;
+        $text = "⚠️ <b>Insufficient Balance!</b>\n━━━━━━━━━━━━━━━\n"
+              . "Product: " . h($productName) . "\n"
+              . "Price: " . money((float)$price) . "\n"
+              . "Your Balance: " . money($balance) . "\n"
+              . "Need to Add: " . money($need) . "\n\n"
+              . "Please add funds to your wallet to purchase this item.";
+        $kb = [
+            [['text' => '➕ Add Funds', 'callback_data' => 'addfund']],
+            [['text' => '⬅️ Back', 'callback_data' => 'store']],
+        ];
+        sendMessage($chatId, $text, $kb);
+        return;
     }
 
+    adjustBalance($telegramId, -$price);
+    $order = createOrder($telegramId, $productName, (string)$price, 'paid');
+
+    $text = "🎉 <b>Order Placed!</b>\n━━━━━━━━━━━━━━━\n"
+          . "Order ID: " . h($order['order_id']) . "\n"
+          . "Product: " . h($productName) . "\n"
+          . "Amount: " . money((float)$price) . "\n"
+          . "New Balance: " . money(getBalance($telegramId)) . "\n\n"
+          . "Status: " . statusLabel('paid') . "\n"
+          . "Our team will deliver your product here shortly.";
+    sendMessage($chatId, $text, backKeyboard('home'));
+
+    notifyAdminOfNewOrder($order);
+}
+
+function showWallet(string $chatId, string $telegramId): void
+{
+    $balance = getBalance($telegramId);
+    $text = "💰 <b>My Wallet</b>\n━━━━━━━━━━━━━━━\n"
+          . "Current Balance:\n<b>" . money($balance) . "</b>\n\n"
+          . "Add funds via UPI — verified by our team, credited to your wallet.";
     $kb = [
-        [['text' => '📤 Submit UTR Now', 'callback_data' => 'subutr_' . $order['order_id']]],
-        [['text' => '📦 My Orders', 'callback_data' => 'orders']],
+        [['text' => '➕ Add Funds', 'callback_data' => 'addfund']],
+        [['text' => '⬅️ Back', 'callback_data' => 'home']],
     ];
     sendMessage($chatId, $text, $kb);
 }
 
 function showOrders(string $chatId, string $telegramId): void
 {
-    $stmt = db()->prepare('SELECT * FROM orders WHERE telegram_id = ? ORDER BY created_at DESC LIMIT 15');
+    $stmt = db()->prepare('SELECT * FROM orders WHERE telegram_id = ? ORDER BY created_at DESC LIMIT 20');
     $stmt->execute([$telegramId]);
     $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
     if (!$orders) {
-        sendMessage($chatId, "📦 <b>You don't have any orders yet!</b>\n\nExplore our store to make your first purchase 🚀", backKeyboard('home'));
+        sendMessage($chatId, "📦 You don't have any orders yet.", backKeyboard('home'));
         return;
     }
 
-    $text = "📦 <b>Your Recent Orders</b> 🚚\n──────────────────────────────\n\n";
+    $text = "<b>📦 My Orders</b>\n━━━━━━━━━━━━━━━\n\n";
     foreach ($orders as $o) {
-        $text .= "🆔 <b>Order #" . h($o['order_id']) . "</b>\n"
-               . "🛍️ " . h($o['product']) . "\n"
-               . "💰 Amount: ₹" . h($o['amount']) . "\n"
-               . "📌 Status: " . statusLabel($o['status']) . "\n";
-        if ($o['status'] === 'completed' && !empty($o['delivery'])) {
-            $text .= "🔑 <b>Item:</b> <code>" . h($o['delivery']) . "</code>\n";
-        }
-        $text .= "──────────────────────────────\n";
+        $text .= "📦 Order #" . h($o['order_id']) . "\n"
+               . "Product: " . h($o['product']) . "\n"
+               . "Amount: ₹" . h($o['amount']) . "\n"
+               . "Status: " . statusLabel($o['status']) . "\n\n";
     }
     sendMessage($chatId, trim($text), backKeyboard('home'));
 }
@@ -378,16 +507,16 @@ function showProfile(string $chatId, string $telegramId, ?string $username, ?str
 
     $total     = count($statuses);
     $completed = count(array_filter($statuses, fn($s) => $s === 'completed'));
-    $pending   = count(array_filter($statuses, fn($s) => in_array($s, ['pending_payment', 'pending_verification'], true)));
+    $pending   = count(array_filter($statuses, fn($s) => $s === 'paid'));
 
-    $text = "👤 <b>User Dashboard Profile</b> 🌟\n\n"
-          . "🆔 <b>Telegram ID:</b> <code>" . h($telegramId) . "</code>\n"
-          . "👤 <b>Name:</b> " . h((string)$firstName) . "\n"
-          . "🏷️ <b>Username:</b> " . ($username ? '@' . h($username) : 'N/A') . "\n\n"
-          . "📊 <b>Activity Stats:</b>\n"
-          . "▫️ Total Orders: <b>" . $total . "</b>\n"
-          . "✅ Completed: <b>" . $completed . "</b>\n"
-          . "⏳ Pending: <b>" . $pending . "</b>";
+    $text = "<b>👤 Profile</b>\n━━━━━━━━━━━━━━━\n"
+          . "User ID: <code>" . h($telegramId) . "</code>\n"
+          . "Username: " . ($username ? '@' . h($username) : '—') . "\n"
+          . "First Name: " . h((string)$firstName) . "\n\n"
+          . "💰 Wallet Balance: " . money(getBalance($telegramId)) . "\n"
+          . "📦 Total Orders: " . $total . "\n"
+          . "🎉 Completed: " . $completed . "\n"
+          . "⏳ Pending Delivery: " . $pending;
     sendMessage($chatId, $text, backKeyboard('home'));
 }
 
@@ -395,118 +524,245 @@ function showSupportPrompt(string $chatId): void
 {
     sendMessage(
         $chatId,
-        "🎟️ <b>Customer Support Desk</b> 🎧\n\nPlease type your message or query below. Our admin team will reply directly to your chat shortly! ✨",
+        "🎟️ <b>" . h(STORE_NAME) . " Support</b>\n━━━━━━━━━━━━━━━\nPlease type your question or issue, and our team will get back to you here.",
         backKeyboard('home')
     );
 }
 
-function showPaymentHelp(string $chatId): void
+// ---------------------------------------------------------------------
+// 9. WALLET TOP-UP SCREENS
+// ---------------------------------------------------------------------
+function promptTopupAmount(string $chatId, string $telegramId): void
 {
-    $text = "💳 <b>Payment Guide & FAQ</b> 💡\n\n"
-          . "1️⃣ Select product from store catalog.\n"
-          . "2️⃣ Pay via UPI using provided UPI ID or QR Code.\n"
-          . "3️⃣ Copy the 12-digit UTR/Reference ID from your payment app.\n"
-          . "4️⃣ Submit the UTR to the bot.\n"
-          . "5️⃣ Admin verifies transaction & delivers your key/product instantly! 🔥";
-    sendMessage($chatId, $text, backKeyboard('home'));
+    setUserState($telegramId, 'awaiting_topup_amount');
+    sendMessage(
+        $chatId,
+        "➕ <b>Add Funds</b>\n━━━━━━━━━━━━━━━\nEnter the amount you'd like to add (₹" . MIN_TOPUP . " – ₹" . MAX_TOPUP . "):"
+    );
+}
+
+function showTopupPaymentScreen(string $chatId, array $topup): void
+{
+    global $upiId, $paymentName, $qrImageUrl;
+
+    $text = "💳 <b>Add Funds — Payment</b>\n━━━━━━━━━━━━━━━\n"
+          . "Request ID: " . h($topup['topup_id']) . "\n"
+          . "Amount: " . money((float)$topup['amount']) . "\n\n"
+          . "Pay via UPI to:\n<code>" . h($upiId) . "</code>\n"
+          . "Name: " . h($paymentName) . "\n\n"
+          . "After paying, tap <b>Submit UTR</b> below.";
+
+    if ($qrImageUrl !== '') {
+        tg('sendPhoto', [
+            'chat_id' => $chatId,
+            'photo'   => $qrImageUrl,
+            'caption' => "Scan to pay " . money((float)$topup['amount']),
+        ]);
+    }
+
+    $kb = [
+        [['text' => '📤 Submit UTR', 'callback_data' => 'subtopututr_' . $topup['topup_id']]],
+        [['text' => '❌ Cancel', 'callback_data' => 'home']],
+    ];
+    sendMessage($chatId, $text, $kb);
 }
 
 // ---------------------------------------------------------------------
-// 7. ADMIN FUNCTIONS
+// 10. UTR VALIDATION
 // ---------------------------------------------------------------------
-function notifyAdminOfPayment(array $order, ?string $username): void
+function isValidUtr(string $utr): bool
 {
-    $text = "🚨 <b>NEW PAYMENT SUBMISSION!</b> 💸\n\n"
-          . "👤 <b>User:</b> " . ($username ? '@' . h($username) : 'N/A') . "\n"
-          . "🆔 <b>User ID:</b> <code>" . h($order['telegram_id']) . "</code>\n"
-          . "📦 <b>Product:</b> " . h($order['product']) . "\n"
-          . "💰 <b>Amount:</b> ₹" . h($order['amount']) . "\n"
-          . "🧾 <b>UTR Code:</b> <code>" . h((string)$order['utr']) . "</code>\n"
-          . "⏳ <b>Status:</b> Awaiting Approval";
+    $utr = trim($utr);
+    if ($utr === '') {
+        return false;
+    }
+    if (mb_strlen($utr) > 40) {
+        return false;
+    }
+    return (bool)preg_match('/^[A-Za-z0-9\- ]+$/', $utr);
+}
+
+function isValidAmount(string $text): bool
+{
+    if (!is_numeric($text)) {
+        return false;
+    }
+    $amount = (float)$text;
+    return $amount >= MIN_TOPUP && $amount <= MAX_TOPUP;
+}
+
+// ---------------------------------------------------------------------
+// 11. ADMIN NOTIFICATIONS & ACTIONS
+// ---------------------------------------------------------------------
+function notifyAdminOfNewOrder(array $order): void
+{
+    $text = "🔔 <b>NEW ORDER — PAID FROM WALLET</b>\n━━━━━━━━━━━━━━━\n"
+          . "Order ID: " . h($order['order_id']) . "\n"
+          . "User ID: <code>" . h($order['telegram_id']) . "</code>\n"
+          . "Product: " . h($order['product']) . "\n"
+          . "Amount: ₹" . h($order['amount']) . "\n\n"
+          . "Send delivery with:\n<code>/deliver " . h($order['order_id']) . " your content</code>";
+    sendMessage(ADMIN_ID, $text);
+}
+
+function notifyAdminOfTopup(array $topup, ?string $username): void
+{
+    $text = "🔔 <b>NEW WALLET TOP-UP VERIFICATION</b>\n━━━━━━━━━━━━━━━\n"
+          . "👤 User: " . ($username ? '@' . h($username) : '—') . "\n"
+          . "🆔 User ID: <code>" . h($topup['telegram_id']) . "</code>\n"
+          . "💰 Amount: " . money((float)$topup['amount']) . "\n"
+          . "🧾 UTR: <code>" . h((string)$topup['utr']) . "</code>\n\n"
+          . "⏳ Status: Pending Verification";
     $kb = [[
-        ['text' => '✅ Approve Payment', 'callback_data' => 'approve_' . $order['order_id']],
-        ['text' => '❌ Reject Payment',  'callback_data' => 'reject_' . $order['order_id']],
+        ['text' => '✅ Approve', 'callback_data' => 'approvetopup_' . $topup['topup_id']],
+        ['text' => '❌ Reject',  'callback_data' => 'rejecttopup_' . $topup['topup_id']],
     ]];
     sendMessage(ADMIN_ID, $text, $kb);
 }
 
 function notifyAdminOfSupport(string $telegramId, ?string $username, string $message): void
 {
-    $text = "📩 <b>New Support Ticket</b> 🎟️\n\n"
-          . "👤 User: " . ($username ? '@' . h($username) : 'N/A') . "\n"
-          . "🆔 ID: <code>" . h($telegramId) . "</code>\n"
-          . "💬 Message: " . h($message) . "\n\n"
-          . "👉 <b>To reply send:</b>\n<code>/reply " . h($telegramId) . " Your response message</code>";
+    $text = "🔔 <b>New Support Message</b>\n━━━━━━━━━━━━━━━\n"
+          . "User: " . ($username ? '@' . h($username) : '—') . "\n"
+          . "User ID: <code>" . h($telegramId) . "</code>\n\n"
+          . "Message:\n" . h($message) . "\n\n"
+          . "Reply with:\n<code>/reply " . h($telegramId) . " your message</code>";
     sendMessage(ADMIN_ID, $text);
 }
 
-function adminApprove(string $orderId): void
+function adminApproveTopup(string $topupId): void
 {
-    $order = getOrder($orderId);
-    if (!$order || $order['status'] !== 'pending_verification') {
-        sendMessage(ADMIN_ID, "⚠️ Order " . h($orderId) . " is not waiting for verification.");
+    $topup = getTopup($topupId);
+    if (!$topup || $topup['status'] !== 'pending_verification') {
+        sendMessage(ADMIN_ID, "⚠️ Top-up " . h($topupId) . " is not awaiting verification (maybe already processed).");
         return;
     }
-    updateOrderStatus($orderId, 'paid');
+    updateTopupStatus($topupId, 'completed');
+    $newBalance = adjustBalance($topup['telegram_id'], (float)$topup['amount']);
 
     sendMessage(
-        $order['telegram_id'],
-        "🎉 <b>Payment Approved!</b> ✅\n\nYour payment for Order <code>" . h($orderId) . "</code> has been verified!\n\n⚡ <i>Preparing digital delivery...</i>"
+        $topup['telegram_id'],
+        "🎉 <b>Wallet Credited!</b>\n━━━━━━━━━━━━━━━\nAmount: " . money((float)$topup['amount']) . "\nNew Balance: " . money($newBalance) . "\n\nYou can now shop in the store!",
+        backKeyboard('home')
     );
-
-    sendMessage(
-        ADMIN_ID,
-        "✅ <b>Order " . h($orderId) . " marked as PAID!</b>\n\nTo deliver item send:\n<code>/deliver " . h($orderId) . " Your Digital Key/Data</code>"
-    );
+    sendMessage(ADMIN_ID, "✅ Top-up " . h($topupId) . " approved. Wallet credited.");
 }
 
-function adminReject(string $orderId): void
+function adminRejectTopup(string $topupId): void
 {
-    $order = getOrder($orderId);
-    if (!$order || $order['status'] !== 'pending_verification') {
-        sendMessage(ADMIN_ID, "⚠️ Order " . h($orderId) . " is not awaiting verification.");
+    $topup = getTopup($topupId);
+    if (!$topup || $topup['status'] !== 'pending_verification') {
+        sendMessage(ADMIN_ID, "⚠️ Top-up " . h($topupId) . " is not awaiting verification (maybe already processed).");
         return;
     }
-    updateOrderStatus($orderId, 'rejected');
+    updateTopupStatus($topupId, 'rejected');
 
     sendMessage(
-        $order['telegram_id'],
-        "❌ <b>Payment Declined!</b>\n\nYour payment submission for Order <code>" . h($orderId) . "</code> was rejected. If you paid, please contact support."
+        $topup['telegram_id'],
+        "❌ <b>Top-up Rejected</b>\n━━━━━━━━━━━━━━━\nRequest ID: " . h($topupId) . "\n\nPlease contact support if you believe this was a mistake."
     );
-
-    sendMessage(ADMIN_ID, "❌ Order " . h($orderId) . " rejected.");
+    sendMessage(ADMIN_ID, "❌ Top-up " . h($topupId) . " rejected.");
 }
 
 function adminDeliver(string $orderId, string $content): void
 {
     $order = getOrder($orderId);
-    if (!$order || $order['status'] !== 'paid') {
-        sendMessage(ADMIN_ID, "⚠️ Cannot deliver. Order non-existent or unpaid.");
+    if (!$order) {
+        sendMessage(ADMIN_ID, "⚠️ Order " . h($orderId) . " not found.");
         return;
     }
-    updateOrderStatus($orderId, 'completed', 'delivery', $content);
+    if ($order['status'] !== 'paid') {
+        sendMessage(ADMIN_ID, "⚠️ Order " . h($orderId) . " is not awaiting delivery.");
+        return;
+    }
+    updateOrderStatus($orderId, 'completed', $content);
 
     sendMessage(
         $order['telegram_id'],
-        "🎉 <b>ORDER DELIVERED!</b> 🎁\n\n"
-      . "🛍️ <b>Product:</b> " . h($order['product']) . "\n"
-      . "🆔 <b>Order ID:</b> <code>" . h($orderId) . "</code>\n\n"
-      . "🔑 <b>Delivery Content / Access Key:</b>\n"
-      . "<code>" . h($content) . "</code>\n\n"
-      . "✨ <i>Thank you for shopping with us!</i>"
+        "🎉 <b>ORDER COMPLETED</b>\n━━━━━━━━━━━━━━━\n📦 Product: " . h($order['product']) . "\n🆔 Order: " . h($orderId) . "\n\n🔑 Delivery:\n" . h($content)
     );
-
-    sendMessage(ADMIN_ID, "🚀 Order " . h($orderId) . " successfully delivered.");
-}
-
-function isValidUtr(string $utr): bool
-{
-    $utr = trim($utr);
-    return !empty($utr) && mb_strlen($utr) <= 40 && (bool)preg_match('/^[A-Za-z0-9\- ]+$/', $utr);
+    sendMessage(ADMIN_ID, "📦 Delivery sent for order " . h($orderId) . ".");
 }
 
 // ---------------------------------------------------------------------
-// 8. ROUTERS (CALLBACK & MESSAGE)
+// 12. ADMIN DASHBOARD (/admin)
+// ---------------------------------------------------------------------
+function showAdminDashboard(string $chatId): void
+{
+    $pdo = db();
+
+    $totalUsers   = (int)$pdo->query('SELECT COUNT(*) FROM users')->fetchColumn();
+    $totalOrders  = (int)$pdo->query('SELECT COUNT(*) FROM orders')->fetchColumn();
+    $totalRevenue = (float)$pdo->query("SELECT COALESCE(SUM(amount),0) FROM orders WHERE status IN ('paid','completed')")->fetchColumn();
+    $pendingDeliv = (int)$pdo->query("SELECT COUNT(*) FROM orders WHERE status = 'paid'")->fetchColumn();
+    $pendingTopup = (int)$pdo->query("SELECT COUNT(*) FROM wallet_topups WHERE status = 'pending_verification'")->fetchColumn();
+
+    $text = "🛠️ <b>Admin Dashboard</b>\n━━━━━━━━━━━━━━━\n"
+          . "👥 Total Users: " . $totalUsers . "\n"
+          . "📦 Total Orders: " . $totalOrders . "\n"
+          . "💰 Total Revenue: " . money($totalRevenue) . "\n\n"
+          . "⏳ Pending Top-up Verifications: " . $pendingTopup . "\n"
+          . "📤 Orders Awaiting Delivery: " . $pendingDeliv;
+
+    $kb = [
+        [['text' => '⏳ Pending Top-ups', 'callback_data' => 'admin_topups']],
+        [['text' => '📤 Pending Deliveries', 'callback_data' => 'admin_deliveries']],
+        [['text' => '🔄 Refresh', 'callback_data' => 'admin_home']],
+    ];
+    sendMessage($chatId, $text, $kb);
+}
+
+function showAdminPendingTopups(string $chatId): void
+{
+    $stmt = db()->query("SELECT * FROM wallet_topups WHERE status = 'pending_verification' ORDER BY created_at ASC LIMIT 10");
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    if (!$rows) {
+        sendMessage($chatId, "✅ No pending top-up verifications.", adminBackKeyboard());
+        return;
+    }
+
+    foreach ($rows as $t) {
+        $text = "🆔 " . h($t['topup_id']) . "\n"
+              . "User: <code>" . h($t['telegram_id']) . "</code>\n"
+              . "Amount: " . money((float)$t['amount']) . "\n"
+              . "UTR: <code>" . h((string)$t['utr']) . "</code>";
+        $kb = [[
+            ['text' => '✅ Approve', 'callback_data' => 'approvetopup_' . $t['topup_id']],
+            ['text' => '❌ Reject',  'callback_data' => 'rejecttopup_' . $t['topup_id']],
+        ]];
+        sendMessage($chatId, $text, $kb);
+    }
+    sendMessage($chatId, 'Use the buttons above, or refresh below.', adminBackKeyboard());
+}
+
+function showAdminPendingDeliveries(string $chatId): void
+{
+    $stmt = db()->query("SELECT * FROM orders WHERE status = 'paid' ORDER BY created_at ASC LIMIT 10");
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    if (!$rows) {
+        sendMessage($chatId, "✅ No orders awaiting delivery.", adminBackKeyboard());
+        return;
+    }
+
+    $text = "📤 <b>Orders Awaiting Delivery</b>\n━━━━━━━━━━━━━━━\n\n";
+    foreach ($rows as $o) {
+        $text .= "🆔 " . h($o['order_id']) . "\n"
+               . "User: <code>" . h($o['telegram_id']) . "</code>\n"
+               . "Product: " . h($o['product']) . "\n"
+               . "Send: <code>/deliver " . h($o['order_id']) . " content</code>\n\n";
+    }
+    sendMessage($chatId, trim($text), adminBackKeyboard());
+}
+
+function adminBackKeyboard(): array
+{
+    return [[['text' => '⬅️ Back to Dashboard', 'callback_data' => 'admin_home']]];
+}
+
+// ---------------------------------------------------------------------
+// 13. CALLBACK ROUTER
 // ---------------------------------------------------------------------
 function handleCallback(array $cb): void
 {
@@ -522,13 +778,13 @@ function handleCallback(array $cb): void
     upsertUser($telegramId, $username, $firstName);
     answerCallback($callbackId);
 
-    $known = ['home', 'store', 'orders', 'payment_help', 'support', 'profile', 'cancel_order'];
+    $known = ['home', 'store', 'orders', 'wallet', 'addfund', 'support', 'profile', 'cancel_order'];
 
     if (in_array($data, $known, true)) {
         switch ($data) {
             case 'home':
                 setUserState($telegramId, 'idle');
-                showHome($chatId, $firstName);
+                showHome($chatId, $telegramId, $firstName);
                 return;
             case 'store':
                 showStore($chatId);
@@ -536,8 +792,11 @@ function handleCallback(array $cb): void
             case 'orders':
                 showOrders($chatId, $telegramId);
                 return;
-            case 'payment_help':
-                showPaymentHelp($chatId);
+            case 'wallet':
+                showWallet($chatId, $telegramId);
+                return;
+            case 'addfund':
+                promptTopupAmount($chatId, $telegramId);
                 return;
             case 'support':
                 setUserState($telegramId, 'awaiting_support');
@@ -548,62 +807,74 @@ function handleCallback(array $cb): void
                 return;
             case 'cancel_order':
                 setUserState($telegramId, 'idle');
-                sendMessage($chatId, '🚫 Order cancelled.', backKeyboard('home'));
+                sendMessage($chatId, '🚫 Cancelled.', backKeyboard('home'));
                 return;
         }
     }
 
+    // Admin-only dashboard callbacks.
+    if (in_array($data, ['admin_home', 'admin_topups', 'admin_deliveries'], true)) {
+        if (!isAdmin($telegramId)) {
+            answerCallback($callbackId, 'Not authorized.', true);
+            return;
+        }
+        match ($data) {
+            'admin_home'       => showAdminDashboard($chatId),
+            'admin_topups'     => showAdminPendingTopups($chatId),
+            'admin_deliveries' => showAdminPendingDeliveries($chatId),
+        };
+        return;
+    }
+
+    // buy_<price>
     if (preg_match('/^buy_(\d+)$/', $data, $m)) {
         showProductConfirm($chatId, (int)$m[1]);
         return;
     }
 
+    // confirm_buy_<price>
     if (preg_match('/^confirm_buy_(\d+)$/', $data, $m)) {
         $price = (int)$m[1];
         if (!isset($PRODUCTS[$price])) {
-            sendMessage($chatId, '⚠️ Product unavailable.', backKeyboard('store'));
+            sendMessage($chatId, '⚠️ That product is no longer available.', backKeyboard('store'));
             return;
         }
-        $order = createOrder($telegramId, $PRODUCTS[$price]['name'], (string)$price);
-        showPaymentScreen($chatId, $order);
+        processPurchase($chatId, $telegramId, $price, $PRODUCTS[$price]['name']);
         return;
     }
 
-    if (preg_match('/^payinfo_(FRENZY-[A-Z0-9]+)$/', $data, $m)) {
-        $order = getOrder($m[1]);
-        if (!$order || $order['telegram_id'] !== $telegramId) {
-            sendMessage($chatId, '⚠️ Order not found.', backKeyboard('orders'));
+    // subtopututr_<topupId>
+    if (preg_match('/^subtopututr_(WALLET-[A-Z0-9]+)$/', $data, $m)) {
+        $topup = getTopup($m[1]);
+        if (!$topup || $topup['telegram_id'] !== $telegramId) {
+            sendMessage($chatId, '⚠️ Request not found.', backKeyboard('wallet'));
             return;
         }
-        showPaymentInstructions($chatId, $order);
+        setUserState($telegramId, 'awaiting_topup_utr:' . $topup['topup_id']);
+        sendMessage($chatId, "Please send your UTR / Transaction ID.");
         return;
     }
 
-    if (preg_match('/^subutr_(FRENZY-[A-Z0-9]+)$/', $data, $m)) {
-        $order = getOrder($m[1]);
-        if (!$order || $order['telegram_id'] !== $telegramId) {
-            sendMessage($chatId, '⚠️ Order not found.', backKeyboard('orders'));
-            return;
-        }
-        setUserState($telegramId, 'awaiting_utr:' . $order['order_id']);
-        sendMessage($chatId, "✍️ <b>Please send your 12-digit UTR/Reference ID now:</b>");
-        return;
-    }
-
-    if (preg_match('/^(approve|reject)_(FRENZY-[A-Z0-9]+)$/', $data, $m)) {
+    // approvetopup_<id> / rejecttopup_<id> — admin only
+    if (preg_match('/^(approvetopup|rejecttopup)_(WALLET-[A-Z0-9]+)$/', $data, $m)) {
         if (!isAdmin($telegramId)) {
-            answerCallback($callbackId, 'Unauthorized!', true);
+            answerCallback($callbackId, 'Not authorized.', true);
             return;
         }
-        if ($m[1] === 'approve') {
-            adminApprove($m[2]);
+        if ($m[1] === 'approvetopup') {
+            adminApproveTopup($m[2]);
         } else {
-            adminReject($m[2]);
+            adminRejectTopup($m[2]);
         }
         return;
     }
+
+    // Unknown callback data — ignore silently, no arbitrary execution.
 }
 
+// ---------------------------------------------------------------------
+// 14. MESSAGE ROUTER
+// ---------------------------------------------------------------------
 function handleMessage(array $msg): void
 {
     $chatId     = (string)$msg['chat']['id'];
@@ -614,15 +885,21 @@ function handleMessage(array $msg): void
 
     upsertUser($telegramId, $username, $firstName);
 
-    // Admin commands
+    // --- Admin-only commands. The Telegram ID itself is the login —
+    // there is no separate admin password to configure or leak. -----
     if (isAdmin($telegramId)) {
+        if ($text === '/admin') {
+            showAdminDashboard($chatId);
+            return;
+        }
+
         if (str_starts_with($text, '/reply ')) {
             $parts = explode(' ', $text, 3);
             if (count($parts) === 3 && ctype_digit($parts[1])) {
-                sendMessage($parts[1], "💬 <b>Support Response:</b>\n\n" . h($parts[2]));
-                sendMessage($chatId, '✅ Support response delivered.');
+                sendMessage($parts[1], "💬 <b>Support Reply</b>\n\n" . h($parts[2]));
+                sendMessage($chatId, '✅ Reply sent.');
             } else {
-                sendMessage($chatId, 'Syntax: /reply <user_id> <message>');
+                sendMessage($chatId, 'Usage: /reply <user_id> <message>');
             }
             return;
         }
@@ -632,67 +909,89 @@ function handleMessage(array $msg): void
             if (count($parts) === 3 && str_starts_with($parts[1], 'FRENZY-')) {
                 adminDeliver($parts[1], $parts[2]);
             } else {
-                sendMessage($chatId, 'Syntax: /deliver <order_id> <digital_item>');
+                sendMessage($chatId, 'Usage: /deliver <order_id> <delivery content>');
             }
+            return;
+        }
+    } else {
+        // Non-admins can never use admin-only commands, even /admin.
+        if ($text === '/admin' || str_starts_with($text, '/reply ') || str_starts_with($text, '/deliver ')) {
+            sendMessage($chatId, '⚠️ You are not authorized to use this command.');
             return;
         }
     }
 
+    // --- /start ---------------------------------------------------------------
     if ($text === '/start') {
         setUserState($telegramId, 'idle');
-        showHome($chatId, $firstName);
+        showHome($chatId, $telegramId, $firstName);
         return;
     }
 
     $state = getUserState($telegramId);
 
-    if (str_starts_with($state, 'awaiting_utr:')) {
-        $orderId = substr($state, strlen('awaiting_utr:'));
-        $order   = getOrder($orderId);
+    // --- Awaiting wallet top-up amount --------------------------------------
+    if ($state === 'awaiting_topup_amount') {
+        if (!isValidAmount($text)) {
+            sendMessage($chatId, "⚠️ Enter a valid amount between ₹" . MIN_TOPUP . " and ₹" . MAX_TOPUP . ".");
+            return;
+        }
+        $topup = createTopup($telegramId, (float)$text);
+        setUserState($telegramId, 'idle');
+        showTopupPaymentScreen($chatId, $topup);
+        return;
+    }
 
-        if (!$order || $order['telegram_id'] !== $telegramId) {
+    // --- Awaiting top-up UTR submission --------------------------------------
+    if (str_starts_with($state, 'awaiting_topup_utr:')) {
+        $topupId = substr($state, strlen('awaiting_topup_utr:'));
+        $topup   = getTopup($topupId);
+
+        if (!$topup || $topup['telegram_id'] !== $telegramId) {
             setUserState($telegramId, 'idle');
-            sendMessage($chatId, '⚠️ Order not found.', backKeyboard('home'));
+            sendMessage($chatId, '⚠️ That request could not be found.', backKeyboard('home'));
             return;
         }
 
         if (!isValidUtr($text)) {
-            sendMessage($chatId, "⚠️ Invalid UTR format. Please send a valid UTR transaction ID.");
+            sendMessage($chatId, "⚠️ That doesn't look like a valid UTR / Transaction ID. Please try again.");
             return;
         }
 
-        updateOrderStatus($orderId, 'pending_verification', 'utr', trim($text));
+        updateTopupStatus($topupId, 'pending_verification', trim($text));
         setUserState($telegramId, 'idle');
 
         sendMessage(
             $chatId,
-            "✅ <b>UTR Received!</b> 🚀\n\nYour order <code>" . h($orderId) . "</code> is now under manual verification by admin.",
+            "✅ <b>UTR Submitted</b>\n━━━━━━━━━━━━━━━\nYour top-up is now:\n⏳ Waiting for admin verification",
             backKeyboard('home')
         );
 
-        notifyAdminOfPayment(getOrder($orderId), $username);
+        notifyAdminOfTopup(getTopup($topupId), $username);
         return;
     }
 
+    // --- Awaiting support message ------------------------------------------
     if ($state === 'awaiting_support') {
         if ($text === '') {
-            sendMessage($chatId, 'Please enter a valid message.');
+            sendMessage($chatId, 'Please type your question or issue as text.');
             return;
         }
         $stmt = db()->prepare('INSERT INTO support_messages (telegram_id, message) VALUES (?, ?)');
         $stmt->execute([$telegramId, $text]);
 
         setUserState($telegramId, 'idle');
-        sendMessage($chatId, "✅ <b>Ticket Submitted!</b>\n\nOur team will review your query and reply directly here soon.", backKeyboard('home'));
+        sendMessage($chatId, "✅ Your message has been sent to our support team. We'll get back to you here soon.", backKeyboard('home'));
         notifyAdminOfSupport($telegramId, $username, $text);
         return;
     }
 
-    sendMessage($chatId, "✨ Please use the buttons below to navigate 👇", mainMenuKeyboard());
+    // --- Fallback ---------------------------------------------------------
+    sendMessage($chatId, "Please use the buttons below to navigate " . h(STORE_NAME) . ".", mainMenuKeyboard());
 }
 
 // ---------------------------------------------------------------------
-// 9. WEBHOOK ENTRY POINT
+// 15. WEBHOOK ENTRY POINT
 // ---------------------------------------------------------------------
 try {
     if (WEBHOOK_SECRET !== '') {
@@ -714,7 +1013,7 @@ try {
         }
     }
 } catch (Throwable $e) {
-    error_log('Bot error: ' . $e->getMessage());
+    error_log('Frenzy Store bot error: ' . $e->getMessage());
     if (isset($chatId) && is_string($chatId)) {
         friendlyError($chatId);
     }
