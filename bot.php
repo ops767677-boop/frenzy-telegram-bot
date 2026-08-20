@@ -29,8 +29,8 @@ const MIN_TOPUP        = 10;
 const MAX_TOPUP        = 100000;
 const REFERRAL_BONUS   = 10; // ₹ credited to referrer on referred user's first paid order
 
-$upiId       = 'YOUR_UPI_ID';
-$paymentName = STORE_NAME;
+$upiId       = 'sahid.frenzy@fam';
+$paymentName = Frenzy Store;
 $qrImageUrl  = '';
 
 // ---------------------------------------------------------------------
