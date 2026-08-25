@@ -2,9 +2,9 @@
 ob_start();
 
 // ========== CONFIG ==========
-$botToken = "YOUR_BOT_API_TOKEN";
+$botToken = "8965830768:AAFVs8RxGGwnLwIW8n1msmD0NUQqwzUIRpA";
 $website = "https://api.telegram.org/bot".$botToken;
-$adminID = "YOUR_ADMIN_ID";
+$adminID = "Y8777129138";
 
 // ========== FILES ==========
 foreach(["balances.json","orders.json","temp.json","users.json","settings.json","categories.json","products.json"] as $f) {
@@ -984,7 +984,7 @@ function sendSelectCatForProduct($chat_id, $message_id){
 
 // ========== USER FUNCTIONS ==========
 function sendMainMenu($chat_id, $name, $balance, $message_id = 0){
-    $msg = "👑 ———— <b>GALU MODZ SELLING BOT</b> ———— 👑\n\n🧡 Yo — ꨄ <b>$name</b>, Welcome Back!!\n\n🔥 ———— WHY CHOOSE US ———— 🔥\n\n🔑 Genuine Premium Keys\n⚡ Instant Auto Delivery\n🛡️ Secure UPI Payments\n💎 Unbeatable Prices\n👊 Real 24/7 Support\n——————————————————————\n💰 Let's get you a key!\n\n💲 <b>Your Balance: ₹$balance.00</b>";
+    $msg = "👑 ———— <b>FRENZY LICENCE BOT</b> ———— 👑\n\n🧡 Yo — ꨄ <b>$name</b>, Welcome Back!!\n\n🔥 ———— WHY CHOOSE US ———— 🔥\n\n🔑 Genuine Premium Keys\n⚡ Instant Auto Delivery\n🛡️ Secure UPI Payments\n💎 Unbeatable Prices\n👊 Real 24/7 Support\n——————————————————————\n💰 Let's get you a key!\n\n💲 <b>Your Balance: ₹$balance.00</b>";
     $kb = [
         [["🛒 Shop Now","shop"]],
         [["📦 My Orders","orders"],["👤 Profile","profile"]],
