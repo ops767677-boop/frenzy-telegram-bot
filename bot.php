@@ -20,7 +20,7 @@ ob_start();
 
 $botToken = "8965830768:AAFVs8RxGGwnLwIW8n1msmD0NUQqwzUIRpA";
 $adminID  = "8777129138";
-$website = "https://api.telegram.org/bot".$botToken;
+$website  = "https://api.telegram.org/bot" . $botToken;
 
 foreach ([
     "balances.json",
@@ -943,7 +943,7 @@ function sendMainMenu($chat_id, $name, $balance, $message_id = 0) {
     $safe = htmlspecialchars($name, ENT_QUOTES, "UTF-8");
 
     $msg =
-        "👑 <b>FRENZY LICENCE BOT</b>\n\n".
+        "👑 <b>SELLING BOT</b>\n\n".
         "🧡 Welcome, <b>$safe</b>!\n\n".
         "🔑 Premium Products\n".
         "⚡ Fast Manual Payment Verification\n".
