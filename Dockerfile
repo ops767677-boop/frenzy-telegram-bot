@@ -12,12 +12,7 @@ WORKDIR /var/www/html
 # Copy bot.php
 COPY bot.php /var/www/html/bot.php
 
-# Create persistent data directory
-RUN mkdir -p /data \
-    && chown -R www-data:www-data /data \
-    && chmod -R 755 /data
-
-# Apache configuration
+# Apache default page ko bot.php par point karo
 RUN printf '%s\n' \
     '<Directory /var/www/html>' \
     '    AllowOverride All' \
@@ -29,9 +24,6 @@ RUN printf '%s\n' \
 # Permissions
 RUN chown -R www-data:www-data /var/www/html \
     && chmod -R 755 /var/www/html
-
-# Persistent storage
-VOLUME ["/data"]
 
 EXPOSE 80
 
