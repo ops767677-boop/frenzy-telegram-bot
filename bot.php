@@ -943,7 +943,7 @@ function sendMainMenu($chat_id, $name, $balance, $message_id = 0) {
     $safe = htmlspecialchars($name, ENT_QUOTES, "UTF-8");
 
     $msg =
-        "👑 <b>SELLING BOT</b>\n\n".
+        "👑 <b>FRENZY LICENCE BOT</b>\n\n".
         "🧡 Welcome, <b>$safe</b>!\n\n".
         "🔑 Premium Products\n".
         "⚡ Fast Manual Payment Verification\n".
