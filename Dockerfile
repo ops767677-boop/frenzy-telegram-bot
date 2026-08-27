@@ -1,28 +1,17 @@
 FROM php:8.2-apache
 
-# Required PHP extensions
-RUN docker-php-ext-install mysqli pdo pdo_mysql
+# Enable PHP cURL for reliable Telegram API requests
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libcurl4-openssl-dev \
+    && docker-php-ext-install curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# Apache configuration
-RUN a2enmod rewrite
+COPY bot_fixed.php /var/www/html/bot.php
 
-# App directory
-WORKDIR /var/www/html
-
-# Copy bot.php
-COPY bot.php /var/www/html/bot.php
-
-# Apache default page ko bot.php par point karo
-RUN printf '%s\n' \
-    '<Directory /var/www/html>' \
-    '    AllowOverride All' \
-    '    Require all granted' \
-    '</Directory>' \
-    > /etc/apache2/conf-available/app.conf \
-    && a2enconf app
-
-# Permissions
-RUN chown -R www-data:www-data /var/www/html \
+# Apache + bot data must be writable by PHP
+RUN echo "ServerName localhost" >> /etc/apache2/apache2.conf \
+    && printf 'DirectoryIndex bot.php index.php index.html\n' > /etc/apache2/mods-enabled/dir.conf \
+    && chown -R www-data:www-data /var/www/html \
     && chmod -R 755 /var/www/html
 
 EXPOSE 80
