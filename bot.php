@@ -21,7 +21,7 @@ ob_start();
 // ============================================================================
 // 1. CONFIGURATION & CONSTANTS
 // ============================================================================
-const BOT_TOKEN = "8916507945:AAF5g9ipcEXQNGlkAY20PVvHKT3kGSA_D4g";
+const BOT_TOKEN = "8647546201:AAHO7k3dazUN50np5NaT2pZdTMzJxPelOHE";
 const ADMIN_ID  = "8777129138";
 
 const MIN_PAYMENT_AMOUNT = 1;
