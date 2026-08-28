@@ -7,7 +7,7 @@ $website = "https://api.telegram.org/bot".$botToken;
 $adminID = "8777129138";
 
 // ========== FILES ==========
-foreach(["balances.json","orders.json","temp.json","users.json","settings.json","categories.json","products.json"] as $f) {
+foreach(["balances.json","orders.json","temp.json","users.json","settings.json","categories.json","products.json","payments.json"] as $f) {
     if(!file_exists($f)) file_put_contents($f, "{}");
 }
 
@@ -16,7 +16,8 @@ $settings = json_decode(file_get_contents("settings.json"), true);
 if(!isset($settings['proof_link'])) $settings['proof_link'] = "https://t.me/YourProofChannel";
 if(!isset($settings['howto_link'])) $settings['howto_link'] = "https://t.me/YourHowToVideo";
 if(!isset($settings['support_user'])) $settings['support_user'] = "@YourSupportUsername";
-if(!isset($settings['api_key'])) $settings['api_key'] = "FAM_FCAA374ADAFD806DCD3AA33A29DBE6AFBB27A09A";
+if(!isset($settings['upi_id'])) $settings['upi_id'] = "sahid.frenzy@fam";
+unset($settings['api_key']);
 file_put_contents("settings.json", json_encode($settings));
 
 // ========== DEFAULT CATEGORIES ==========
@@ -333,24 +334,33 @@ else if($data){
         editMsg($chat_id, $message_id, "💬 <b>Support Username Bhejo</b>", btn([[["⬅️ Cancel","backadmin"]]])); 
     }
     
-    // ---- 15. API KEY ----
-    else if($data == "setapi" && $user_id == $adminID){ 
-        saveTemp($user_id, "waiting", "api"); 
-        editMsg($chat_id, $message_id, "🔑 <b>FamPay API Key Bhejo</b>\n\nExample: FAM_FCAA374ADAFD806DCD3AA33A29DBE6AFBB27A09A", btn([[["⬅️ Cancel","backadmin"]]])); 
+    // ---- 15. UPI ID ----
+    else if($data == "setupi" && $user_id == $adminID){
+        saveTemp($user_id, "waiting", "upi");
+        editMsg($chat_id, $message_id, "💳 <b>UPI ID Bhejo</b>\n\nExample: sahid.frenzy@fam", btn([[['⬅️ Cancel','backadmin']]]));
     }
-    
-    // ---- 16. BACK TO ADMIN ----
+
+    // ---- 16. PAYMENT REQUESTS ----
+    else if($data == "paymentreq" && $user_id == $adminID){
+        sendPaymentRequests($chat_id, $message_id);
+    }
+
+    // ---- 17. BACK TO ADMIN ----
     else if($data == "backadmin"){
         sendAdminPanel($chat_id, $message_id);
     }
     
-    // ---- PAYMENT ----
-    else if(strpos($data, "pay_") === 0){ $amount = str_replace("pay_","",$data); createFamPayOrder($chat_id, $message_id, $user_id, $amount); }
+    // ---- MANUAL PAYMENT ----
+    else if(strpos($data, "pay_") === 0){ $amount = (int)str_replace("pay_","",$data); createManualPayment($chat_id, $message_id, $user_id, $amount); }
     else if($data == "custom"){ saveTemp($user_id, "amount", "0"); sendKeypad($chat_id, $message_id, $user_id, "0"); }
     else if(strpos($data, "key_") === 0){ handleKeypad($chat_id, $message_id, $user_id, str_replace("key_","",$data)); }
-    else if(strpos($data, "confirm_") === 0){ $amount = str_replace("confirm_","",$data); createFamPayOrder($chat_id, $message_id, $user_id, $amount); }
-    else if(strpos($data, "check_") === 0){ checkPayment($chat_id, $message_id, str_replace("check_","",$data)); }
-    else if(strpos($data, "cancel_") === 0){ cancelOrder($chat_id, $message_id, str_replace("cancel_","",$data)); }
+    else if(strpos($data, "confirm_") === 0){ $amount = (int)str_replace("confirm_","",$data); createManualPayment($chat_id, $message_id, $user_id, $amount); }
+    else if(strpos($data, "submitutr_") === 0){ requestUTR($chat_id, $message_id, $user_id, str_replace("submitutr_","",$data)); }
+    else if(strpos($data, "cancelpay_") === 0){ cancelManualPayment($chat_id, $message_id, $user_id, str_replace("cancelpay_","",$data)); }
+    else if(strpos($data, "reviewpay_") === 0 && $user_id == $adminID){ reviewPayment($chat_id, $message_id, str_replace("reviewpay_","",$data)); }
+    else if(strpos($data, "approve_pay_") === 0 && $user_id == $adminID){ approvePayment($chat_id, $message_id, str_replace("approve_pay_","",$data)); }
+    else if(strpos($data, "reject_pay_") === 0 && $user_id == $adminID){ rejectPayment($chat_id, $message_id, str_replace("reject_pay_","",$data)); }
+    else if($data == "paymentreq" && $user_id == $adminID){ sendPaymentRequests($chat_id, $message_id); }
     
     // ---- NAVIGATION ----
     else if($data == "back") sendMainMenu($chat_id, $first_name, $balances[$user_id], $message_id);
@@ -618,20 +628,56 @@ else if($text && $text != "/start" && $text != "/admin"){
         sendMessage($chat_id, "✅ Support Username Update: $text"); 
         sendAdminPanel($chat_id, 0); 
     }
-    else if($waiting == "api" && $user_id == $adminID){ 
-        $settings['api_key'] = trim($text); 
-        file_put_contents("settings.json", json_encode($settings)); 
-        $temp[$user_id]['waiting'] = ""; 
-        file_put_contents("temp.json", json_encode($temp)); 
-        sendMessage($chat_id, "✅ API Key Update: ".substr($text,0,20)."..."); 
-        sendAdminPanel($chat_id, 0); 
+    else if($waiting == "upi" && $user_id == $adminID){
+        $upi = trim($text);
+        if(!preg_match('/^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$/', $upi)){
+            sendMessage($chat_id, "❌ Invalid UPI ID. Example: sahid.frenzy@fam");
+            return;
+        }
+        $settings['upi_id'] = $upi;
+        file_put_contents("settings.json", json_encode($settings));
+        $temp[$user_id]['waiting'] = "";
+        file_put_contents("temp.json", json_encode($temp));
+        sendMessage($chat_id, "✅ UPI ID Update: <code>".htmlspecialchars($upi, ENT_QUOTES, 'UTF-8')."</code>");
+        sendAdminPanel($chat_id, 0);
     }
     
+    // ---- MANUAL PAYMENT UTR ----
+    else if($waiting == "payment_utr"){
+        $payment_id = $temp[$user_id]['payment_id'] ?? '';
+        $utr = trim($text);
+        if(!preg_match('/^[A-Za-z0-9._-]{6,80}$/', $utr)){
+            sendMessage($chat_id, "❌ Invalid UTR / Transaction ID. Dubara exact UTR bhejo.");
+            return;
+        }
+        $payments = json_decode(file_get_contents("payments.json"), true);
+        if(!isset($payments[$payment_id]) || (string)$payments[$payment_id]['user'] !== (string)$user_id){
+            $temp[$user_id]['waiting'] = '';
+            file_put_contents("temp.json", json_encode($temp));
+            sendMessage($chat_id, "❌ Payment request nahi mila.", btn([[['⬅️ Back','backkey']]]));
+            return;
+        }
+        if($payments[$payment_id]['status'] !== 'pending_utr'){
+            $temp[$user_id]['waiting'] = '';
+            file_put_contents("temp.json", json_encode($temp));
+            sendMessage($chat_id, "⚠️ Is payment request ka UTR already submit/process ho chuka hai.");
+            return;
+        }
+        $payments[$payment_id]['utr'] = $utr;
+        $payments[$payment_id]['status'] = 'pending_review';
+        $payments[$payment_id]['submitted_at'] = time();
+        file_put_contents("payments.json", json_encode($payments, JSON_PRETTY_PRINT));
+        $temp[$user_id]['waiting'] = '';
+        $temp[$user_id]['payment_id'] = '';
+        file_put_contents("temp.json", json_encode($temp));
+        sendMessage($chat_id, "⏳ <b>Payment Under Review</b>\n\nAmount: <b>₹{$payments[$payment_id]['amount']}</b>\nUTR: <code>$utr</code>\nRequest: <code>$payment_id</code>\n\nAdmin manually verify karega. Approval ke baad balance add hoga.", btn([[['⬅️ Back to Menu','back']]]));
+        sendMessage($adminID, "🔔 <b>New Payment Verification Request</b>\n\n🆔 <code>$payment_id</code>\n👤 User: <code>$user_id</code>\n💰 Amount: <b>₹{$payments[$payment_id]['amount']}</b>\n🧾 UTR: <code>$utr</code>", btn([[['👁️ Review Payment','reviewpay_'.$payment_id]]]));
+    }
     // ---- CUSTOM AMOUNT ----
     else if(isset($temp[$user_id]['amount'])){
         $amount = (int)$text;
         if($amount >= 1 && $amount <= 5000){
-            createFamPayOrder($chat_id, 0, $user_id, $amount);
+            createManualPayment($chat_id, 0, $user_id, $amount);
             $temp[$user_id]['amount'] = null;
             file_put_contents("temp.json", json_encode($temp));
         }else{
@@ -706,7 +752,7 @@ function sendAdminPanel($chat_id, $message_id = 0){
            "📄 Proof: {$settings['proof_link']}\n".
            "📖 HowTo: {$settings['howto_link']}\n".
            "💬 Support: {$settings['support_user']}\n".
-           "🔑 API Key: ".substr($settings['api_key'],0,20)."...";
+           "💳 UPI ID: <code>{$settings['upi_id']}</code>";
     $kb = [
         [["📁 Add Category","addcat"]],
         [["📦 Add Product","addprod"]],
@@ -722,7 +768,8 @@ function sendAdminPanel($chat_id, $message_id = 0){
         [["📄 Proof Link","setproof"]],
         [["📖 HowTo Link","sethowto"]],
         [["💬 Support Username","setsupport"]],
-        [["🔑 API Key","setapi"]],
+        [["💳 UPI ID","setupi"]],
+        [["💳 Payment Requests","paymentreq"]],
         [["⬅️ Back to Menu","back"]]
     ];
     if($message_id > 0) editMsg($chat_id, $message_id, $msg, btn($kb));
@@ -1081,7 +1128,7 @@ function sendSupport($chat_id, $message_id){
 function sendAddBalance($chat_id, $message_id, $user_id){ 
     global $balances; 
     $bal = $balances[$user_id] ?? 0; 
-    $msg = "💸 <b>Add Balance</b>\n\nCurrent balance: ₹$bal.00\nPick a quick amount below, or enter a custom amount.\nMin: ₹1.00 • Max: ₹5,000.00\n⚠️ QR 5 Minute me expire ho jayega"; 
+    $msg = "💸 <b>Add Balance</b>\n\nCurrent balance: ₹$bal.00\nPick a quick amount below, or enter a custom amount.\nMin: ₹1.00 • Max: ₹5,000.00\n⚠️ Payment ke baad UTR submit karo. Balance admin approval ke baad hi add hoga."; 
     $kb = [
         [["₹50","pay_50"],["₹100","pay_100"],["₹200","pay_200"]],
         [["₹500","pay_500"],["₹1000","pay_1000"],["₹2000","pay_2000"]],
@@ -1119,77 +1166,166 @@ function handleKeypad($chat_id, $message_id, $user_id, $key){
     sendKeypad($chat_id, $message_id, $user_id, $amount); 
 }
 
-// ========== PAYMENT FUNCTIONS ==========
-function createFamPayOrder($chat_id, $message_id, $user_id, $amount){ 
+// ========== MANUAL PAYMENT FUNCTIONS ==========
+function createManualPayment($chat_id, $message_id, $user_id, $amount){
     $settings = json_decode(file_get_contents("settings.json"), true);
-    $api_key = $settings['api_key'];
-    if($amount < 1 || $amount > 5000){ 
-        editMsg($chat_id, $message_id, "❌ Amount ₹1 se ₹5000 ke beech me hona chahiye", btn([[["⬅️ Back","backkey"]]])); 
-        return; 
-    } 
-    $url = "https://fampaygateway.site/api/create_order.php?amount=$amount&api_key=$api_key"; 
-    $res = @json_decode(file_get_contents($url), true); 
-    if($res['status'] == "success"){ 
-        $data = $res['data']; 
-        $order_id = $data['order_id']; 
-        $expire_time = time() + (5 * 60); 
-        $orders = json_decode(file_get_contents("orders.json"), true); 
-        $orders[$order_id] = ["user"=>$user_id,"amount"=>$amount,"status"=>"pending","created"=>time(),"expire"=>$expire_time]; 
-        file_put_contents("orders.json", json_encode($orders)); 
-        $expire_display = date("H:i:s", $expire_time); 
-        $msg = "💸 <b>Payment Request</b>\n\nAmount: ₹{$data['amount']}\nOrder ID: <code>{$data['order_id']}</code>\nUPI ID: <code>{$data['upi_id']}</code>\n⏰ Expire: $expire_display <b></b>\n\nQR scan karke turant payment karo"; 
-        sendPhoto($chat_id, $data['qr_url'], $msg, btn([["🔄 Check Payment","check_$order_id"],["❌ Cancel Order","cancel_$order_id"],["⬅️ Back","backkey"]])); 
-        if($message_id > 0) deleteMsg($chat_id, $message_id); 
-    } else { 
-        editMsg($chat_id, $message_id, "❌ Order create nahi hua. Dubara try karo\n\nError: ".($res['message']??"Unknown"), btn([[["⬅️ Back","backkey"]]])); 
-    } 
+    $upi = trim($settings['upi_id'] ?? '');
+    if($amount < 1 || $amount > 5000){
+        $fn = $message_id > 0 ? 'editMsg' : 'sendMessage';
+        $fn($chat_id, "❌ Amount ₹1 se ₹5000 ke beech me hona chahiye", btn([[['⬅️ Back','backkey']]]));
+        return;
+    }
+    if($upi === ''){
+        $fn = $message_id > 0 ? 'editMsg' : 'sendMessage';
+        $fn($chat_id, "❌ Payment UPI ID admin ne set nahi ki hai.", btn([[['⬅️ Back','backkey']]]));
+        return;
+    }
+
+    $payment_id = 'PAY'.date('YmdHis').rand(100,999);
+    $payments = json_decode(file_get_contents("payments.json"), true);
+    $payments[$payment_id] = [
+        'user' => $user_id,
+        'amount' => $amount,
+        'upi_id' => $upi,
+        'status' => 'pending_utr',
+        'utr' => '',
+        'created' => time(),
+        'approved_at' => 0
+    ];
+    file_put_contents("payments.json", json_encode($payments, JSON_PRETTY_PRINT));
+
+    $upi_uri = 'upi://pay?'.http_build_query([
+        'pa'=>$upi,
+        'pn'=>'Frenzy Panel Store',
+        'am'=>number_format($amount,2,'.',''),
+        'cu'=>'INR',
+        'tn'=>'Frenzy '.$payment_id
+    ], '', '&', PHP_QUERY_RFC3986);
+    $qr_url = 'https://api.qrserver.com/v1/create-qr-code/?size=600x600&data='.rawurlencode($upi_uri);
+
+    $msg = "💳 <b>Manual Payment</b>\n\n".
+           "💰 Amount: <b>₹$amount</b>\n".
+           "🏦 UPI ID: <code>".htmlspecialchars($upi, ENT_QUOTES, 'UTF-8')."</code>\n".
+           "🆔 Request ID: <code>$payment_id</code>\n\n".
+           "1️⃣ QR scan karke exactly <b>₹$amount</b> pay karo.\n".
+           "2️⃣ Payment ke baad <b>UTR / Transaction ID</b> submit karo.\n".
+           "3️⃣ Admin manually verify karke balance add karega.\n\n".
+           "⚠️ UTR submit karne se balance automatic add nahi hoga.";
+    sendPhoto($chat_id, $qr_url, $msg, btn([
+        [["🧾 Submit UTR","submitutr_$payment_id"]],
+        [["❌ Cancel","cancelpay_$payment_id"]],
+        [["⬅️ Back","backkey"]]
+    ]));
+    if($message_id > 0) deleteMsg($chat_id, $message_id);
 }
 
-function checkPayment($chat_id, $message_id, $order_id){ 
-    $settings = json_decode(file_get_contents("settings.json"), true);
-    $api_key = $settings['api_key'];
-    $orders = json_decode(file_get_contents("orders.json"), true); 
-    if(!isset($orders[$order_id])){ 
-        editMsg($chat_id, $message_id, "❌ Order nahi mila ya expire ho gaya", btn([[["⬅️ Back","backkey"]]])); 
-        return; 
-    } 
-    if(time() > $orders[$order_id]['expire']){ 
-        $orders[$order_id]['status'] = "expired"; 
-        file_put_contents("orders.json", json_encode($orders)); 
-        editMsg($chat_id, $message_id, "❌ <b>Order Expired!</b>\n\n5 Minute ho gaye. Naya order banao", btn([[["➕ New Payment","backkey"]]])); 
-        return; 
-    } 
-    if($orders[$order_id]['status'] == "paid"){ 
-        editMsg($chat_id, $message_id, "✅ Payment already ho chuki hai", btn([[["⬅️ Menu","back"]]])); 
-        return; 
-    } 
-    $url = "https://fampaygateway.site/api/verify.php?order_id=$order_id&api_key=$api_key"; 
-    $res = @json_decode(file_get_contents($url), true); 
-    if($res['status'] == "success" && isset($res['data']['utr'])){ 
-        $amount = $res['data']['amount']; 
-        $user_id = $orders[$order_id]['user']; 
-        $balances = json_decode(file_get_contents("balances.json"), true); 
-        $balances[$user_id] += $amount; 
-        file_put_contents("balances.json", json_encode($balances)); 
-        $orders[$order_id]['status'] = "paid"; 
-        file_put_contents("orders.json", json_encode($orders)); 
-        $msg = "✅ <b>Payment Successful!</b>\n\n₹$amount Balance me add ho gaya\nUTR: <code>{$res['data']['utr']}</code>\nTime: {$res['data']['payment_time']}"; 
-        editMsg($chat_id, $message_id, $msg, btn([[["⬅️ Menu","back"]]])); 
-    } else { 
-        $remaining = $orders[$order_id]['expire'] - time(); 
-        $min = floor($remaining/60); 
-        $sec = $remaining%60; 
-        editMsg($chat_id, $message_id, "⏳ <b>Payment Pending</b>\n\nOrder Expire: {$min}m {$sec}s me\n'Check Payment' dabate raho", btn([["🔄 Check Payment","check_$order_id"],["❌ Cancel Order","cancel_$order_id"],["⬅️ Back","backkey"]])); 
-    } 
+function requestUTR($chat_id, $message_id, $user_id, $payment_id){
+    $payments = json_decode(file_get_contents("payments.json"), true);
+    if(!isset($payments[$payment_id]) || (string)$payments[$payment_id]['user'] !== (string)$user_id){
+        editMsg($chat_id, $message_id, "❌ Payment request nahi mila.", btn([[['⬅️ Back','backkey']]]));
+        return;
+    }
+    if($payments[$payment_id]['status'] !== 'pending_utr'){
+        editMsg($chat_id, $message_id, "ℹ️ Is payment request ka UTR already submit ho chuka hai ya request close hai.", btn([[['⬅️ Back','backkey']]]));
+        return;
+    }
+    saveTemp($user_id, 'waiting', 'payment_utr');
+    saveTemp($user_id, 'payment_id', $payment_id);
+    editMsg($chat_id, $message_id, "🧾 <b>UTR / Transaction ID bhejo</b>\n\nRequest: <code>$payment_id</code>\nAmount: <b>₹{$payments[$payment_id]['amount']}</b>\n\nSirf payment ka UTR bhejo.", btn([[['⬅️ Cancel','backkey']]]));
 }
 
-function cancelOrder($chat_id, $message_id, $order_id){ 
-    $orders = json_decode(file_get_contents("orders.json"), true); 
-    if(isset($orders[$order_id])){ 
-        $orders[$order_id]['status'] = "cancelled"; 
-        file_put_contents("orders.json", json_encode($orders)); 
-        editMsg($chat_id, $message_id, "❌ <b>Order Cancelled</b>\n\nNaya payment kar sakte ho", btn([[["➕ New Payment","backkey"]]])); 
-    } 
+function cancelManualPayment($chat_id, $message_id, $user_id, $payment_id){
+    $payments = json_decode(file_get_contents("payments.json"), true);
+    if(isset($payments[$payment_id]) && (string)$payments[$payment_id]['user'] === (string)$user_id && in_array($payments[$payment_id]['status'], ['pending_utr','pending_review'], true)){
+        $payments[$payment_id]['status'] = 'cancelled';
+        file_put_contents("payments.json", json_encode($payments, JSON_PRETTY_PRINT));
+    }
+    editMsg($chat_id, $message_id, "❌ <b>Payment Request Cancelled</b>", btn([[['⬅️ Back to Menu','back']]]));
+}
+
+function sendPaymentRequests($chat_id, $message_id = 0){
+    $payments = json_decode(file_get_contents("payments.json"), true);
+    $pending = [];
+    foreach($payments as $id => $p){
+        if(in_array($p['status'], ['pending_review'], true)) $pending[$id] = $p;
+    }
+    if(count($pending) === 0){
+        $msg = "💳 <b>Payment Requests</b>\n\n✅ Koi pending payment request nahi hai.";
+        $kb = [[['⬅️ Back to Admin','backadmin']]];
+    } else {
+        $msg = "💳 <b>Pending Payment Requests</b>\n\n";
+        $kb = [];
+        foreach(array_reverse($pending, true) as $id => $p){
+            $utr = htmlspecialchars($p['utr'] ?? '', ENT_QUOTES, 'UTF-8');
+            $msg .= "🆔 <code>$id</code>\n👤 User: <code>{$p['user']}</code>\n💰 Amount: <b>₹{$p['amount']}</b>\n🧾 UTR: <code>$utr</code>\n\n";
+            $kb[] = [["👁️ Review ₹{$p['amount']} - $id", "reviewpay_$id"]];
+        }
+        $kb[] = [['⬅️ Back to Admin','backadmin']];
+    }
+    if($message_id > 0) editMsg($chat_id, $message_id, $msg, btn($kb)); else sendMessage($chat_id, $msg, btn($kb));
+}
+
+function reviewPayment($chat_id, $message_id, $payment_id){
+    $payments = json_decode(file_get_contents("payments.json"), true);
+    if(!isset($payments[$payment_id])){
+        editMsg($chat_id, $message_id, "❌ Payment request nahi mila.", btn([[['⬅️ Back','paymentreq']]]));
+        return;
+    }
+    $p = $payments[$payment_id];
+    $msg = "💳 <b>Payment Review</b>\n\n".
+           "🆔 Request: <code>$payment_id</code>\n".
+           "👤 User: <code>{$p['user']}</code>\n".
+           "💰 Amount: <b>₹{$p['amount']}</b>\n".
+           "🏦 UPI: <code>".htmlspecialchars($p['upi_id'], ENT_QUOTES, 'UTF-8')."</code>\n".
+           "🧾 UTR: <code>".htmlspecialchars($p['utr'], ENT_QUOTES, 'UTF-8')."</code>\n".
+           "📅 Submitted: ".date('d M Y H:i', $p['created'])."";
+    editMsg($chat_id, $message_id, $msg, btn([
+        [["✅ Approve +₹{$p['amount']}","approve_pay_$payment_id"]],
+        [["❌ Reject","reject_pay_$payment_id"]],
+        [["⬅️ Back","paymentreq"]]
+    ]));
+}
+
+function approvePayment($chat_id, $message_id, $payment_id){
+    $payments = json_decode(file_get_contents("payments.json"), true);
+    if(!isset($payments[$payment_id])){
+        editMsg($chat_id, $message_id, "❌ Payment request nahi mila.", btn([[['⬅️ Back','paymentreq']]]));
+        return;
+    }
+    if($payments[$payment_id]['status'] !== 'pending_review'){
+        editMsg($chat_id, $message_id, "⚠️ Ye request already process ho chuki hai.", btn([[['⬅️ Back','paymentreq']]]));
+        return;
+    }
+    $target = $payments[$payment_id]['user'];
+    $amount = (int)$payments[$payment_id]['amount'];
+    $balances = json_decode(file_get_contents("balances.json"), true);
+    $balances[$target] = ($balances[$target] ?? 0) + $amount;
+    file_put_contents("balances.json", json_encode($balances, JSON_PRETTY_PRINT));
+    $payments[$payment_id]['status'] = 'approved';
+    $payments[$payment_id]['approved_at'] = time();
+    $payments[$payment_id]['approved_by'] = $chat_id;
+    file_put_contents("payments.json", json_encode($payments, JSON_PRETTY_PRINT));
+    sendMessage($target, "✅ <b>Payment Approved!</b>\n\n₹$amount aapke balance me add ho gaya.\n🧾 UTR: <code>".htmlspecialchars($payments[$payment_id]['utr'], ENT_QUOTES, 'UTF-8')."</code>\n💰 New Balance: <b>₹{$balances[$target]}</b>");
+    editMsg($chat_id, $message_id, "✅ <b>Payment Approved</b>\n\n₹$amount User <code>$target</code> ke balance me add kar diya gaya.\nRequest: <code>$payment_id</code>", btn([[['⬅️ Payment Requests','paymentreq']],[['⬅️ Admin','backadmin']]]));
+}
+
+function rejectPayment($chat_id, $message_id, $payment_id){
+    $payments = json_decode(file_get_contents("payments.json"), true);
+    if(!isset($payments[$payment_id])){
+        editMsg($chat_id, $message_id, "❌ Payment request nahi mila.", btn([[['⬅️ Back','paymentreq']]]));
+        return;
+    }
+    if($payments[$payment_id]['status'] !== 'pending_review'){
+        editMsg($chat_id, $message_id, "⚠️ Ye request already process ho chuki hai.", btn([[['⬅️ Back','paymentreq']]]));
+        return;
+    }
+    $payments[$payment_id]['status'] = 'rejected';
+    $payments[$payment_id]['rejected_at'] = time();
+    $payments[$payment_id]['rejected_by'] = $chat_id;
+    file_put_contents("payments.json", json_encode($payments, JSON_PRETTY_PRINT));
+    $target = $payments[$payment_id]['user'];
+    sendMessage($target, "❌ <b>Payment Rejected</b>\n\nRequest <code>$payment_id</code> verify nahi ho saka.\nUTR: <code>".htmlspecialchars($payments[$payment_id]['utr'], ENT_QUOTES, 'UTF-8')."</code>\n\nSupport se contact karo agar payment kiya hai.");
+    editMsg($chat_id, $message_id, "❌ <b>Payment Rejected</b>\n\nRequest: <code>$payment_id</code>", btn([[['⬅️ Payment Requests','paymentreq']],[['⬅️ Admin','backadmin']]]));
 }
 
 // ========== SEND FUNCTIONS FOR BROADCAST ==========
