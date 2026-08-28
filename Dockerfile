@@ -1,12 +1,9 @@
-FROM php:8.2-apache
+FROM php:8.5-cli
 
-RUN echo "ServerName localhost" >> /etc/apache2/apache2.conf
+WORKDIR /app
 
-COPY bot.php /var/www/html/index.php
+COPY bot.php /app/bot.php
 
-RUN chown -R www-data:www-data /var/www/html \
-    && chmod -R 755 /var/www/html
+EXPOSE 8080
 
-EXPOSE 80
-
-CMD ["apache2-foreground"]
+CMD ["php", "-S", "0.0.0.0:8080", "-t", "/app"]
