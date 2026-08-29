@@ -750,7 +750,7 @@ function sendAdminPanel($chat_id, $message_id = 0){
     $msg = "👑 <b>Admin Panel</b>\n\n".
            "👥 Total Users: $total_users\n".
            "📄 Proof: {$settings['proof_link']}\n".
-           "📖 HowTo: {$settings['howto_link']}\n".
+           "📖 Show Case: {$settings['showcase_link']}\n".
            "💬 Support: {$settings['support_user']}\n".
            "💳 UPI ID: <code>{$settings['upi_id']}</code>";
     $kb = [
@@ -766,7 +766,7 @@ function sendAdminPanel($chat_id, $message_id = 0){
         [["👥 User List","userlist"]],
         [["💰 Add User Balance","adduserbal"]],
         [["📄 Proof Link","setproof"]],
-        [["📖 HowTo Link","sethowto"]],
+        [["📖 Show Case","sethowto"]],
         [["💬 Support Username","setsupport"]],
         [["💳 UPI ID","setupi"]],
         [["💳 Payment Requests","paymentreq"]],
